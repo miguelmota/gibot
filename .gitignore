@@ -1,3 +1,6 @@
 .DS_Store
 build/
 *.csv
+bin/
+tmp.txt
+*.bak

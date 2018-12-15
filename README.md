@@ -1,5 +1,5 @@
 # gibot
 
-wip
+> (experimental)
 
 [MIT](LICENSE)
