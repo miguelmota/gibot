@@ -5,9 +5,13 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -42,6 +46,7 @@ type Bot struct {
 type Config struct {
 	AccessToken string
 	Username    string
+	StorePath   string
 }
 
 // NewBot ...
@@ -53,20 +58,82 @@ func NewBot(config *Config) *Bot {
 	)
 	tc := oauth2.NewClient(context.Background(), ts)
 	client := github.NewClient(tc)
+
+	configPath := normalizePath(config.StorePath)
+
+	if configPath == "" {
+		configPath = "./"
+	}
+
+	targetFile := fmt.Sprintf("%s/targets.csv", configPath)
+	followersFile := fmt.Sprintf("%s/original_followers.csv", configPath)
+	followingFile := fmt.Sprintf("%s/original_following.csv", configPath)
 	return &Bot{
 		client:                client,
 		username:              config.Username,
 		targets:               make(map[string]*target),
-		targetFile:            "targets.csv",
+		targetFile:            targetFile,
 		originalFollowers:     make(map[string]bool),
-		originalFollowersFile: "original_followers.csv",
+		originalFollowersFile: followersFile,
 		originalFollowing:     make(map[string]bool),
-		originalFollowingFile: "original_following.csv",
+		originalFollowingFile: followingFile,
 	}
 }
 
+// StartConfig ...
+type StartConfig struct {
+	Search   bool
+	Queries  []string
+	Follow   bool
+	Unfollow bool
+}
+
 // Start ...
-func (b *Bot) Start() error {
+func (b *Bot) Start(config *StartConfig) error {
+	go b.handleExitSignal()
+
+	search := config.Search
+	queries := config.Queries
+	followTargets := config.Follow
+	unfollowTargets := config.Unfollow
+
+	err := b.loadState()
+	if err != nil {
+		return err
+	}
+
+	if search {
+		err := b.searchActiveUsers(queries)
+		if err != nil {
+			return err
+		}
+		if err := b.saveTargets(); err != nil {
+			return err
+		}
+	}
+
+	if followTargets {
+		if err := b.followTargets(); err != nil {
+			return err
+		}
+		if err := b.saveTargets(); err != nil {
+			return err
+		}
+	}
+
+	if unfollowTargets {
+		if err := b.unfollowTargets(); err != nil {
+			return err
+		}
+		if err := b.saveTargets(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (b *Bot) loadState() error {
 	if _, err := os.Stat(b.originalFollowersFile); !os.IsNotExist(err) {
 		f, err := os.Open(b.originalFollowersFile)
 		if err != nil {
@@ -183,115 +250,47 @@ func (b *Bot) Start() error {
 			}
 		}
 	}
-
-	search := false
-	if search {
-		query := "ethereum"
-		users, err := b.searchUsers(query, 100)
-		if err != nil {
-			return err
-		}
-
-		var wg sync.WaitGroup
-		for _, user := range users {
-			wg.Add(1)
-			go func(user github.User) {
-				defer wg.Done()
-				time.Sleep(1 * time.Second)
-				username := user.GetLogin()
-				isActive, lastActivity, err := b.isActive(username)
-				if err != nil {
-					log.Errorf("got error; %s\n", err)
-					return
-				}
-				if isActive {
-					_, found := b.targets[username]
-					if !found {
-						b.targets[username] = &target{
-							username:     username,
-							lastActivity: lastActivity,
-							followed:     false,
-							followedDate: nil,
-							deleted:      false,
-						}
-					}
-				}
-			}(user)
-		}
-		wg.Wait()
-
-		log.Printf("targets found %v\n", len(b.targets))
-
-		if err := b.saveTargets(); err != nil {
-			return err
-		}
-	}
-
-	go b.handleExitSignal()
-	if err := b.startFollowing(); err != nil {
-		return err
-	}
-	if err := b.saveTargets(); err != nil {
-		return err
-	}
-
-	/*
-		if err := b.deleteFollowing(); err != nil {
-			return err
-		}
-	*/
-
 	return nil
 }
 
-func (b *Bot) handleExitSignal() {
-	var gracefulStop = make(chan os.Signal)
-	signal.Notify(gracefulStop, syscall.SIGTERM)
-	signal.Notify(gracefulStop, syscall.SIGINT)
-	go func() {
-		sig := <-gracefulStop
-		log.Printf("caught signal: %+v\n", sig)
-		log.Println("saving latest state...")
-		if err := b.saveTargets(); err != nil {
-			panic(err)
-		}
-		os.Exit(0)
-	}()
-}
-
-func (b *Bot) deleteFollowing() error {
-	for _, target := range b.targets {
-		if !target.followed || target.deleted {
-			continue
-		}
-		time.Sleep(5 * time.Second)
-		if err := b.unfollow(target.username); err != nil {
-			log.Errorf("unfollow error: %v", err)
-			continue
-		}
-		log.Printf("unfollowed following: %s\n", target.username)
-		b.targets[target.username].deleted = true
-	}
-
-	return nil
-}
-
-func (b *Bot) startFollowing() error {
+func (b *Bot) followTargets() error {
+	log.Println("starting following of targets")
 	for _, target := range b.targets {
 		if target.followed {
 			continue
 		}
-		time.Sleep(5 * time.Second)
 		if err := b.follow(target.username); err != nil {
-			log.Errorf("follow error: %v", err)
+			log.Errorf("follow target error: %v", err)
 			continue
 		}
-		log.Printf("followed target: %s\n", target.username)
+		log.Printf("followed target user %q\n", target.username)
 		b.targets[target.username].followed = true
 		t := time.Now()
 		b.targets[target.username].followedDate = &t
+		randomSleep()
 	}
 
+	log.Println("done following all targets")
+	return nil
+}
+
+func (b *Bot) unfollowTargets() error {
+	log.Println("starting unfollowing all targets")
+	for _, target := range b.targets {
+		_, ok := b.originalFollowing[target.username]
+		if ok || target.deleted || !target.followed {
+			continue
+		}
+		if err := b.unfollow(target.username); err != nil {
+			log.Errorf("unfollow target error: %v", err)
+			continue
+		}
+		log.Printf("unfollowed target %q\n", target.username)
+		b.targets[target.username].deleted = true
+		randomSleep()
+	}
+
+	log.Println("done unfollowing all followed targets")
 	return nil
 }
 
@@ -329,46 +328,13 @@ func (b *Bot) saveTargets() error {
 		}
 	}
 
-	// Write any buffered data to the underlying writer (standard output).
 	w.Flush()
 
 	if err := w.Error(); err != nil {
 		return err
 	}
 
-	log.Println("done")
-	return nil
-}
-
-func (b *Bot) saveFollowers(followers []*github.User) error {
-	records := [][]string{
-		[]string{"username"},
-	}
-	for _, follower := range followers {
-		records = append(records, []string{
-			follower.GetLogin(),
-		})
-	}
-
-	fo, err := os.Create(b.originalFollowersFile)
-	if err != nil {
-		return err
-	}
-	w := csv.NewWriter(fo)
-
-	for _, record := range records {
-		if err := w.Write(record); err != nil {
-			log.Fatalln("error writing record to csv:", err)
-		}
-	}
-
-	// Write any buffered data to the underlying writer (standard output).
-	w.Flush()
-
-	if err := w.Error(); err != nil {
-		return err
-	}
-
+	log.Println("done saving targets to file")
 	return nil
 }
 
@@ -394,7 +360,6 @@ func (b *Bot) saveFollowing(following []*github.User) error {
 		}
 	}
 
-	// Write any buffered data to the underlying writer (standard output).
 	w.Flush()
 
 	if err := w.Error(); err != nil {
@@ -402,6 +367,91 @@ func (b *Bot) saveFollowing(following []*github.User) error {
 	}
 
 	return nil
+}
+
+func (b *Bot) saveFollowers(followers []*github.User) error {
+	records := [][]string{
+		[]string{"username"},
+	}
+	for _, follower := range followers {
+		records = append(records, []string{
+			follower.GetLogin(),
+		})
+	}
+
+	fo, err := os.Create(b.originalFollowersFile)
+	if err != nil {
+		return err
+	}
+	w := csv.NewWriter(fo)
+
+	for _, record := range records {
+		if err := w.Write(record); err != nil {
+			log.Fatalln("error writing record to csv:", err)
+		}
+	}
+
+	w.Flush()
+
+	if err := w.Error(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (b *Bot) getFollowing(username string) ([]*github.User, error) {
+	var collection []*github.User
+	page := 1
+	lastSize := 100
+	for i := 0; lastSize >= 100; i++ {
+		following, resp, err := b.client.Users.ListFollowing(context.Background(), username, &github.ListOptions{
+			Page:    page,
+			PerPage: 100,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != 200 {
+			log.Errorf("received status code %v\n", resp.StatusCode)
+			break
+		}
+		lastSize = len(following)
+		page++
+		log.Printf("fetching %v following\n", lastSize)
+		collection = append(collection, following...)
+	}
+
+	log.Printf("fetched %v following\n", len(collection))
+
+	return collection, nil
+}
+
+func (b *Bot) getFollowers(username string) ([]*github.User, error) {
+	var collection []*github.User
+	page := 1
+	lastSize := 100
+	for i := 0; lastSize >= 100; i++ {
+		followers, resp, err := b.client.Users.ListFollowers(context.Background(), username, &github.ListOptions{
+			Page:    page,
+			PerPage: 100,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != 200 {
+			log.Errorf("received status code %v\n", resp.StatusCode)
+			break
+		}
+		lastSize = len(followers)
+		page++
+		log.Printf("fetching %v followers\n", lastSize)
+		collection = append(collection, followers...)
+	}
+
+	log.Printf("fetched %v followers\n", len(collection))
+
+	return collection, nil
 }
 
 func (b *Bot) isActive(username string) (bool, *time.Time, error) {
@@ -470,6 +520,7 @@ func (b *Bot) searchUsers(query string, limit int) ([]github.User, error) {
 	page := 1
 	lastSize := 100
 	maxPage := 5
+	log.Printf("searching users with %q\n", query)
 	for i := 0; lastSize >= 100 && page < maxPage; i++ {
 		result, resp, err := b.client.Search.Users(context.Background(), query, &github.SearchOptions{
 			ListOptions: github.ListOptions{
@@ -486,67 +537,113 @@ func (b *Bot) searchUsers(query string, limit int) ([]github.User, error) {
 		}
 		lastSize = len(result.Users)
 		page++
-		log.Printf("fetching %v followers\n", lastSize)
+		log.Printf("fetching %v users for term %q", lastSize, query)
 		collection = append(collection, result.Users...)
 	}
 
 	return collection, nil
 }
 
-func (b *Bot) getFollowers(username string) ([]*github.User, error) {
-	var collection []*github.User
-	page := 1
-	lastSize := 100
-	for i := 0; lastSize >= 100; i++ {
-		followers, resp, err := b.client.Users.ListFollowers(context.Background(), username, &github.ListOptions{
-			Page:    page,
-			PerPage: 100,
-		})
+func (b *Bot) searchActiveUsers(queries []string) error {
+	log.Println("starting searching for active users")
+	for _, query := range queries {
+		query := strings.TrimSpace(query)
+		if query == "" {
+			continue
+		}
+		users, err := b.searchUsers(query, 100)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		if resp.StatusCode != 200 {
-			log.Errorf("received status code %v\n", resp.StatusCode)
-			break
+
+		var wg sync.WaitGroup
+		for _, user := range users {
+			wg.Add(1)
+			go func(user github.User) {
+				defer wg.Done()
+				username := user.GetLogin()
+				_, ok := b.originalFollowing[username]
+				if ok {
+					return
+				}
+
+				isActive, lastActivity, err := b.isActive(username)
+				if err != nil {
+					log.Errorf("got error; %s\n", err)
+					return
+				}
+				if isActive {
+					_, found := b.targets[username]
+					if !found {
+						b.targets[username] = &target{
+							username:     username,
+							lastActivity: lastActivity,
+							followed:     false,
+							followedDate: nil,
+							deleted:      false,
+						}
+					}
+				}
+			}(user)
 		}
-		lastSize = len(followers)
-		page++
-		log.Printf("fetching %v followers\n", lastSize)
-		collection = append(collection, followers...)
+		wg.Wait()
+
+		log.Printf("found %v active targets\n", len(b.targets))
 	}
 
-	log.Printf("fetched %v followers\n", len(collection))
-
-	return collection, nil
+	log.Println("done searching for active users")
+	return nil
 }
 
-func (b *Bot) getFollowing(username string) ([]*github.User, error) {
-	var collection []*github.User
-	page := 1
-	lastSize := 100
-	for i := 0; lastSize >= 100; i++ {
-		following, resp, err := b.client.Users.ListFollowing(context.Background(), username, &github.ListOptions{
-			Page:    page,
-			PerPage: 100,
-		})
-		if err != nil {
-			return nil, err
+func (b *Bot) handleExitSignal() {
+	var gracefulStop = make(chan os.Signal)
+	signal.Notify(gracefulStop, syscall.SIGTERM)
+	signal.Notify(gracefulStop, syscall.SIGINT)
+	go func() {
+		sig := <-gracefulStop
+		log.Printf("caught signal: %+v\n", sig)
+		log.Println("saving latest state")
+		if err := b.saveTargets(); err != nil {
+			panic(err)
 		}
-		if resp.StatusCode != 200 {
-			log.Errorf("received status code %v\n", resp.StatusCode)
-			break
+		os.Exit(0)
+	}()
+}
+
+func randomSleep() {
+	i := randomInt(1, 7)
+	time.Sleep(time.Duration(i) * time.Second)
+}
+
+func randomInt(min, max int) int {
+	return rand.Intn(max-min) + min
+}
+
+func userHomeDir() string {
+	if runtime.GOOS == "windows" {
+		home := os.Getenv("HOMEDRIVE") + os.Getenv("HOMEPATH")
+		if home == "" {
+			home = os.Getenv("USERPROFILE")
 		}
-		lastSize = len(following)
-		page++
-		log.Printf("fetching %v following\n", lastSize)
-		collection = append(collection, following...)
+		return home
+	} else if runtime.GOOS == "linux" {
+		home := os.Getenv("XDG_CONFIG_HOME")
+		if home != "" {
+			return home
+		}
+	}
+	return os.Getenv("HOME")
+}
+
+func normalizePath(path string) string {
+	// expand tilde
+	if strings.HasPrefix(path, "~/") {
+		path = filepath.Join(userHomeDir(), path[2:])
 	}
 
-	log.Printf("fetched %v following\n", len(collection))
-
-	return collection, nil
+	return path
 }
 
 func init() {
-	log.SetReportCaller(true)
+	rand.Seed(time.Now().UTC().UnixNano())
 }
