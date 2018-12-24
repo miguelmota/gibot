@@ -267,7 +267,7 @@ func (b *Bot) followTargets() error {
 		b.targets[target.username].followed = true
 		t := time.Now()
 		b.targets[target.username].followedDate = &t
-		randomSleep()
+		longWait()
 	}
 
 	log.Println("done following all targets")
@@ -287,7 +287,7 @@ func (b *Bot) unfollowTargets() error {
 		}
 		log.Printf("unfollowed target %q\n", target.username)
 		b.targets[target.username].deleted = true
-		randomSleep()
+		throttleWait()
 	}
 
 	log.Println("done unfollowing all followed targets")
@@ -610,8 +610,13 @@ func (b *Bot) handleExitSignal() {
 	}()
 }
 
-func randomSleep() {
+func throttleWait() {
 	i := randomInt(1, 7)
+	time.Sleep(time.Duration(i) * time.Second)
+}
+
+func longWait() {
+	i := randomInt(500, 1000)
 	time.Sleep(time.Duration(i) * time.Second)
 }
 
