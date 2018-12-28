@@ -59,10 +59,15 @@ func NewBot(config *Config) *Bot {
 	tc := oauth2.NewClient(context.Background(), ts)
 	client := github.NewClient(tc)
 
-	configPath := normalizePath(config.StorePath)
+	configPath := NormalizePath(config.StorePath)
 
 	if configPath == "" {
 		configPath = "./"
+	}
+
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		log.Printf("creating config directory %s", configPath)
+		os.MkdirAll(configPath, os.ModePerm)
 	}
 
 	targetFile := fmt.Sprintf("%s/targets.csv", configPath)
@@ -281,13 +286,13 @@ func (b *Bot) unfollowTargets() error {
 		if ok || target.deleted || !target.followed {
 			continue
 		}
-		if err := b.unfollow(target.username); err != nil {
+		if err := b.Unfollow(target.username); err != nil {
 			log.Errorf("unfollow target error: %v", err)
 			continue
 		}
 		log.Printf("unfollowed target %q\n", target.username)
 		b.targets[target.username].deleted = true
-		throttleWait()
+		b.ThrottleWait()
 	}
 
 	log.Println("done unfollowing all followed targets")
@@ -502,7 +507,8 @@ func (b *Bot) follow(username string) error {
 	return nil
 }
 
-func (b *Bot) unfollow(username string) error {
+// Unfollow ...
+func (b *Bot) Unfollow(username string) error {
 	resp, err := b.client.Users.Unfollow(context.Background(), username)
 	if int(resp.StatusCode/100) != 2 {
 		log.Errorf("received status code %v\n", resp.StatusCode)
@@ -595,6 +601,12 @@ func (b *Bot) searchActiveUsers(queries []string) error {
 	return nil
 }
 
+// ThrottleWait ...
+func (b *Bot) ThrottleWait() {
+	i := randomInt(1, 7)
+	time.Sleep(time.Duration(i) * time.Second)
+}
+
 func (b *Bot) handleExitSignal() {
 	var gracefulStop = make(chan os.Signal)
 	signal.Notify(gracefulStop, syscall.SIGTERM)
@@ -608,11 +620,6 @@ func (b *Bot) handleExitSignal() {
 		}
 		os.Exit(0)
 	}()
-}
-
-func throttleWait() {
-	i := randomInt(1, 7)
-	time.Sleep(time.Duration(i) * time.Second)
 }
 
 func longWait() {
@@ -640,7 +647,8 @@ func userHomeDir() string {
 	return os.Getenv("HOME")
 }
 
-func normalizePath(path string) string {
+// NormalizePath ...
+func NormalizePath(path string) string {
 	// expand tilde
 	if strings.HasPrefix(path, "~/") {
 		path = filepath.Join(userHomeDir(), path[2:])
